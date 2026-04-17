@@ -1,6 +1,6 @@
-# CUDA SHA-256 Kernel
+# CUDA PSI / OPRF Library
 
-Simple CUDA C++ example that computes SHA-256 on the GPU (one message per thread, single 512-bit block), and uses OpenSSL SHA-256 on CPU for timing and correctness checks.
+CUDA-based building blocks for PSI-oriented OPRF work over Curve25519, including field arithmetic, Elligator2 mapping, scalar multiplication, and a first sender/receiver TCP scaffold.
 
 ## Build
 
@@ -9,21 +9,40 @@ make
 make field25519_test
 ```
 
-## Run
+## OPRF Interfaces
+
+The main OPRF entry points are now the two TCP-facing binaries:
+
+- `target/oprf_sender`: server-side process that listens on a TCP port, holds the sender secret scalar `b`, evaluates received blinded points, and returns the results.
+- `target/oprf_receiver`: client-side process that samples receiver inputs and receiver scalar `a`, blinds inputs on the GPU, sends them to the sender, and receives the evaluated outputs.
+
+Build them with:
 
 ```bash
-make run ARGS="1000 128"
+make -B oprf_sender
+make -B oprf_receiver
 ```
 
-You can also run the binary directly:
+Run the sender in one terminal:
 
 ```bash
-./vector_mul 1000 128
+./target/oprf_sender 9000
 ```
 
-Arguments:
-- `num_messages`: number of random messages to hash.
-- `sample_checks` (optional): number of random hashes to compare (GPU vs OpenSSL CPU). Default is `min(num_messages, 1024)`.
+Run the receiver in another terminal:
+
+```bash
+./target/oprf_receiver 127.0.0.1 9000 4096
+```
+
+Current scaffold behavior:
+- the receiver samples random `x` inputs and a receiver scalar `a`
+- the receiver computes `y = H(x)^a` on the GPU
+- the receiver sends the blinded `y` values to the sender over TCP
+- the sender applies its secret scalar `b` on the GPU and returns `z = y^b`
+- both sides print connection success and application-level communication cost in bytes
+
+This is the first networked split of the existing pipeline. It is not yet a complete finalized OPRF protocol with serialization hardening, transcript handling, or unblinding/finalization logic.
 
 ## Field Arithmetic Test
 
@@ -31,6 +50,7 @@ Build and run the 256-bit field arithmetic validator (mod `2^255 - 19`):
 
 ```bash
 make field_test ARGS=4096
+make field_test_run ARGS=4096
 ```
 
 This compares CUDA `fe25519` add/mul kernels against OpenSSL big-number `BN_mod_add` and `BN_mod_mul` on random vectors.
@@ -41,7 +61,7 @@ Build and run Tonelli-Shanks square-root validation (no bigint library):
 
 ```bash
 make field_sqrt_test ARGS=4096
-make field_sqrt_test ARGS="4096 10"
+make field_sqrt_test_run ARGS="4096 10"
 ```
 
 Test method:
@@ -66,7 +86,7 @@ Build and run GPU Allegator2 map-to-curve (`Curve25519` Montgomery `u`) with sam
 
 ```bash
 make allegator25519_compare_test
-make allegator_test ARGS="100000 1024"
+make allegator_test_run ARGS="100000 1024"
 ```
 
 Arguments:
@@ -85,7 +105,7 @@ Build and run Curve25519 scalar-multiplication (`scalar * u`) comparison:
 
 ```bash
 make curve25519_scalarmult_test
-make scalarmult_test ARGS="100000 1024"
+make scalarmult_test_run ARGS="100000 1024"
 ```
 
 Arguments:
@@ -101,7 +121,7 @@ Build and run OPRF flow with two independently sampled keys `a,b` (mod Curve2551
 
 ```bash
 make OPRF
-make oprf ARGS="10000 512"
+make oprf_run ARGS="10000 512"
 ```
 
 Pipeline per input `x`:
@@ -118,11 +138,20 @@ Behavior:
 
 ## Files
 
-- `main.cu`: CUDA SHA-256 kernel, host setup, and CPU digest cross-check.
-- `field25519_kernel.cu`: CUDA kernels for 256-bit field add/mul/sqrt modulo `2^255 - 19`.
-- `field25519_test.cu`: Host test harness that validates field kernels against OpenSSL BN arithmetic.
-- `field25519_sqrt_test.cu`: Host test harness for GPU Tonelli-Shanks sqrt via resquare validation.
-- `allegator25519_compare_test.cu`: GPU Allegator2 mapping test with sampled libsodium CPU reference checks.
-- `curve25519_scalarmult_test.cu`: GPU X25519 scalar-multiplication test with sampled libsodium reference checks.
-- `OPRF.cu`: End-to-end OPRF pipeline using Allegator map and two separate scalar multiplications.
-- `Makefile`: Build and run helpers.
+- `include/fe25519.cuh`: shared `fe25519` field-element type.
+- `include/oprf_gpu.hpp`: shared GPU-side host helpers for scalar sampling, encoding, and launching the existing CUDA kernels.
+- `include/oprf_tcp.hpp`: TCP socket helpers for connecting, listening, and sending fixed-size payloads reliably.
+- `src/field25519_arith.cuh`: finite-field arithmetic modulo `2^255 - 19`.
+- `src/curve25519_decode.cuh`: byte-to-field and field-to-byte encoding helpers.
+- `src/curve25519_scalarmult.cuh`: X25519 scalar-multiplication helpers on Montgomery `u` coordinates.
+- `src/curve25519_elligator.cuh`: Elligator2 map-to-curve helper for Curve25519 `u`.
+- `src/field25519_sqrt.cuh`: Tonelli-Shanks square-root routine over the field.
+- `src/kernels.cu`: exported CUDA kernels for field arithmetic, Elligator mapping, and Curve25519 scalar multiplication.
+- `bin/field25519_test.cu`: host test harness that validates field kernels against OpenSSL BN arithmetic.
+- `bin/field25519_sqrt_test.cu`: host test harness for GPU Tonelli-Shanks sqrt via resquare validation.
+- `bin/allegator25519_compare_test.cu`: GPU Allegator2 mapping test with sampled libsodium CPU reference checks.
+- `bin/curve25519_scalarmult_test.cu`: GPU X25519 scalar-multiplication test with sampled libsodium reference checks.
+- `bin/OPRF.cu`: single-process OPRF pipeline benchmark using two separate scalar multiplications.
+- `bin/oprf_sender.cu`: TCP sender/server for the networked OPRF scaffold.
+- `bin/oprf_receiver.cu`: TCP receiver/client for the networked OPRF scaffold.
+- `Makefile`: build and run helpers.
