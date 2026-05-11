@@ -70,35 +70,47 @@ std::string feHex(const fe25519& x) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // 1) Parse optional CLI args:
+    //    argv[1] = total number of random 32-byte inputs to test
+    //    argv[2] = number of sampled CPU reference checks
     int n = 4096;
     int sampleChecks = 256;
     if (argc > 3 || (argc >= 2 && !parsePositiveInt(argv[1], &n)) || (argc == 3 && !parsePositiveInt(argv[2], &sampleChecks))) {
         std::cerr << "Usage: " << argv[0] << " [num_elements] [cpu_sample_checks]\n";
         return 1;
     }
+    // 2) Never sample more indices than we generated.
     sampleChecks = std::min(sampleChecks, n);
 
+    // 3) Initialize libsodium for CPU reference path.
     if (sodium_init() < 0) {
         std::cerr << "sodium_init failed\n";
         return 1;
     }
 
+    // 4) Allocate host buffers:
+    //    - hInputs: n random 32-byte uniform values
+    //    - hGpuU: GPU-produced curve25519 u-coordinates (fe25519 layout)
     std::vector<uint8_t> hInputs(static_cast<size_t>(n) * 32u);
     std::vector<fe25519> hGpuU(static_cast<size_t>(n));
 
+    // 5) Fill inputs deterministically for repeatable comparisons.
     std::mt19937_64 rng(42);
     for (size_t i = 0; i < hInputs.size(); ++i) {
         hInputs[i] = static_cast<uint8_t>(rng() & 0xFFu);
     }
 
+    // 6) Device buffers for input bytes and output field elements.
     uint8_t* dInputs = nullptr;
     fe25519* dOut = nullptr;
 
     const size_t inBytes = hInputs.size() * sizeof(uint8_t);
     const size_t outBytes = hGpuU.size() * sizeof(fe25519);
 
+    // 7) Start end-to-end CUDA timing (allocation + copies + kernel + copy back).
     const auto cudaStart = std::chrono::high_resolution_clock::now();
 
+    // 8) Allocate device memory.
     if (!checkCuda(cudaMalloc(&dInputs, inBytes), "cudaMalloc dInputs") ||
         !checkCuda(cudaMalloc(&dOut, outBytes), "cudaMalloc dOut")) {
         cudaFree(dInputs);
@@ -106,15 +118,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 9) Copy host inputs to GPU.
     if (!checkCuda(cudaMemcpy(dInputs, hInputs.data(), inBytes, cudaMemcpyHostToDevice), "cudaMemcpy hInputs")) {
         cudaFree(dInputs);
         cudaFree(dOut);
         return 1;
     }
 
+    // 10) Configure launch so each thread handles one element index.
     const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
 
+    // 11) CUDA events for kernel-only timing.
     cudaEvent_t kernelStart = nullptr;
     cudaEvent_t kernelStop = nullptr;
     if (!checkCuda(cudaEventCreate(&kernelStart), "cudaEventCreate kernelStart") ||
@@ -126,6 +141,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 12) Record start event, launch kernel, then record/await stop event.
     if (!checkCuda(cudaEventRecord(kernelStart), "cudaEventRecord kernelStart")) {
         cudaEventDestroy(kernelStart);
         cudaEventDestroy(kernelStop);
@@ -146,6 +162,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 13) Extract elapsed kernel execution time in milliseconds.
     float kernelMs = 0.0f;
     if (!checkCuda(cudaEventElapsedTime(&kernelMs, kernelStart, kernelStop), "cudaEventElapsedTime")) {
         cudaEventDestroy(kernelStart);
@@ -157,23 +174,28 @@ int main(int argc, char** argv) {
     cudaEventDestroy(kernelStart);
     cudaEventDestroy(kernelStop);
 
+    // 14) Copy GPU outputs back to host for validation.
     if (!checkCuda(cudaMemcpy(hGpuU.data(), dOut, outBytes, cudaMemcpyDeviceToHost), "cudaMemcpy dOut")) {
         cudaFree(dInputs);
         cudaFree(dOut);
         return 1;
     }
 
+    // 15) End end-to-end CUDA timing and release device memory.
     const auto cudaEnd = std::chrono::high_resolution_clock::now();
     const double cudaTotalMs = std::chrono::duration<double, std::milli>(cudaEnd - cudaStart).count();
 
     cudaFree(dInputs);
     cudaFree(dOut);
 
-    // CPU reference only on sampled indices.
+    // 16) Build a shuffled index list so CPU validation checks a random subset.
     std::vector<int> indices(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) indices[static_cast<size_t>(i)] = i;
     std::shuffle(indices.begin(), indices.end(), std::mt19937(1337));
 
+    // 17) For each sampled index:
+    //     uniform32 -> ed25519 point (libsodium) -> curve25519 u-byte encoding
+    //     decode to fe25519 and compare against GPU output.
     const auto cpuRefStart = std::chrono::high_resolution_clock::now();
     for (int k = 0; k < sampleChecks; ++k) {
         const int idx = indices[static_cast<size_t>(k)];
@@ -198,9 +220,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // 18) CPU reference timing for sampled comparisons.
     const auto cpuRefEnd = std::chrono::high_resolution_clock::now();
     const double cpuRefMs = std::chrono::duration<double, std::milli>(cpuRefEnd - cpuRefStart).count();
 
+    // 19) Report validation success and timing breakdown.
     std::cout << "Allegator2 curve25519-u comparison passed\n";
     std::cout << "Total elements: " << n << ", CPU reference sample checks: " << sampleChecks << "\n";
     std::cout << std::fixed << std::setprecision(6);
